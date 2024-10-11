@@ -40,6 +40,7 @@ import java.io.*;
 import java.nio.charset.Charset;
 import java.util.ArrayDeque;
 import java.util.Deque;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
@@ -53,6 +54,11 @@ import java.util.stream.Collectors;
  */
 public class CollationServer {
     private static final Logger LOG = Logger.getLogger(CollationServer.class.getName());
+
+    private static final int COLLATION_TIMEOUT = 59;
+
+    private final Map<String, Thread> collationsInProgress = new ConcurrentHashMap<>();
+    private final ScheduledExecutorService  collationWatchers;
 
     private final int maxCollationSize;
     private final String dotPath;
@@ -68,6 +74,17 @@ public class CollationServer {
                 final Thread t = new Thread(r, "collator-" + counter.incrementAndGet());
                 t.setDaemon(true);
                 t.setPriority(Thread.MIN_PRIORITY);
+                return t;
+            }
+        });
+        collationWatchers = Executors.newScheduledThreadPool(maxParallelCollations, new ThreadFactory() {
+            private final AtomicLong counter = new AtomicLong();
+
+            @Override
+            public Thread newThread(Runnable r) {
+                final Thread t = new Thread(r, "collation-watcher-" + counter.incrementAndGet());
+                t.setDaemon(true);
+                t.setPriority(Thread.MAX_PRIORITY);
                 return t;
             }
         });
@@ -144,6 +161,7 @@ public class CollationServer {
         response.suspend(60, TimeUnit.SECONDS, new EmptyCompletionHandler<>());
         collationThreads.submit(() -> {
             try {
+                collationsInProgress.put(request.getRequestId(), Thread.currentThread());
                 final VariantGraph graph = new VariantGraph();
                 collation.collate(graph);
 
@@ -267,8 +285,22 @@ public class CollationServer {
                 }
             } catch (IOException e) {
                 // FIXME: ignored
+            } finally {
+                collationsInProgress.remove(request.getRequestId());
             }
         });
+        collationWatchers.schedule(() -> {
+            Thread t = collationsInProgress.remove(request.getRequestId());
+            if (t != null) {
+                try {
+                    t.stop();
+                    response.sendError(204, "");
+                } catch (IOException e) {
+                    throw new RuntimeException("Error stopping collation thread " + t.getName(), e);
+                }
+                response.resume();
+            }
+        }, COLLATION_TIMEOUT, TimeUnit.SECONDS);
     }
 
     private static Deque<String> path(Request request) {
